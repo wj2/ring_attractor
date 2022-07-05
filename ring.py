@@ -4,6 +4,7 @@ import scipy.signal as sps
 import itertools as it
 import matplotlib.pyplot as plt
 import scipy.linalg as scl
+import scipy.optimize as spo
 import matplotlib as mpl
 from matplotlib.gridspec import GridSpec
 import matplotlib.ticker as ticker
@@ -705,18 +706,96 @@ class RingAttractor(object):
     def __init__(self, n_neurs, tau, transfer_func, tf_params,
                  weight_func=diff_exponential_weightfunc,
                  wf_params=(1, 1, .3), stp=False, big_u=.1, tau_x=150,
-                 tau_u=650):
+                 tau_u=650, divide_wm=False, bias=10):
         self.thetas = get_thetas(n_neurs)
         self.n_neurs = n_neurs
         self.w = compute_weight_matrix(self.thetas, weight_func,
                                        wf_params)
+        if divide_wm:
+            self.w = self.w/n_neurs
         self.tf = lambda x: transfer_func(x, *tf_params)
         self.tau = tau
-        self.bias = 0
+        self.bias = bias
         self.stp = stp
         self.big_u = big_u
         self.tau_u = tau_u
         self.tau_x = tau_x
+        self.wf_params = wf_params
+        self.bump_stats = None
+        self.noise_mag = None
+
+    def compute_bump_statistics_empirical(self, t_until=200, t_step=1, eps=.1):
+        if self.bump_stats is None:
+            self.initialize_network(init_scale=.1)
+            out, focus, _, ts = self.integrate_until(t_until, t_step,
+                                                     dynamics='noiseless',
+                                                     drive_func=None)
+            delt = np.diff(self.thetas)[0]
+            tc = np.sum(out[-1] > eps)*delt/2
+            a_star = np.max(out[-1])
+            a = a_star/(1 - np.cos(tc))
+            c = np.cos(tc)*a
+
+            pb_emp = np.sum(out[-1])
+            self.bump_stats = (tc, a, c, pb_emp)
+        
+        return self.bump_stats
+
+    def compute_pc(self, cue, **kwargs):
+        tc, a, c, pb_emp = self.compute_bump_statistics_empirical(self, **kwargs)
+        if (c + cue) > a:
+            pc = 0
+        else:
+            tc_cue = np.arccos((c + cue)/a)
+            pc = 2*a*(np.sin(tc_cue) - tc_cue*np.cos(tc_cue))
+        return pc
+
+    def compute_pc_empirical(self, cue, cue_start=200, cue_dur=400, tstep=1):
+        t_until = cue_start + cue_dur
+        cue_mask = np.mod(np.arange(len(self.thetas)), 2) == 0
+        cue_opp = step_drive_function_creator(self.thetas, 0, 2*np.pi, 
+                                              -cue, cue_start,
+                                              cue_start + cue_dur,
+                                              pop_mask=np.logical_not(cue_mask))
+        
+        out, focus, _, ts = self.integrate_until(t_until, tstep,
+                                                 dynamics='noiseless',
+                                                 drive_func=cue_opp)
+        pb_emp = np.sum(out[-1, np.logical_not(cue_mask)])
+        pc_emp = np.sum(out[-1, cue_mask])
+        pt_emp = np.sum(out[-1])
+
+        return pb_emp, pc_emp, pt_emp
+
+    def estimate_noise(self, t_until=600, t_step=1, eps=.1,
+                       wait=200):
+        if self.noise_mag is None:
+            self.initialize_network(init_scale=.1)
+            out, focus, _, ts = self.integrate_until(t_until, t_step,
+                                                     dynamics='poisson',
+                                                     drive_func=None)
+            delt = np.diff(self.thetas)[0]
+            t_mask = ts > wait
+            pb_traj = np.sum(out[t_mask], axis=1)*delt
+            pb_std = np.std(pb_traj, axis=0)
+            
+            self.noise_mag = pb_std
+        
+        return self.noise_mag        
+        
+    def compute_bump_statistics(self):
+        ji, je, _ = self.wf_params
+        je = je
+        ji = ji
+        
+        f_tc = lambda tc: (np.pi*2/je + .5*np.sin(2*tc) - tc)**2
+        res = spo.minimize(f_tc, .01)
+        tc = res.x
+        
+        denom = -(ji/np.pi)*(np.sin(tc) - tc*np.cos(tc)) - np.cos(tc)
+        a = self.bias/denom
+        c = a*np.cos(tc)
+        return tc, a, c
 
     def _step_stp_dynamics(self, dt):
         du_1 = -(self.u - self.big_u)/self.tau_u
@@ -728,7 +807,7 @@ class RingAttractor(object):
 
     def state(self):
         return self._curr_state
-        
+
     def dynamics_noiseless(self, drive, dt):
         g = self.tf(np.dot(self.w, self._curr_state) + self.bias + drive)
         if self.stp:
@@ -746,14 +825,43 @@ class RingAttractor(object):
         dr = -self._curr_state + spks
         return dr/self.tau
 
+    def dynamics_poisson_f(self, drive, dt):
+        self._curr_spks = np.random.poisson(self.tf(self._curr_state)*dt)
+        g = np.dot(self.w, self._curr_spks) + self.bias + drive
+        if self.stp:
+            g = self.u*self.x*self.tau*g
+            self._step_stp_dynamics(dt)
+        dr = -self._curr_state + g
+        return dr/self.tau
+
+    def dynamics_noiseless_f(self, drive, dt):
+        self._curr_spks = self.tf(self._curr_state)
+        g = np.dot(self.w, self._curr_spks) + self.bias + drive
+        if self.stp:
+            g = self.u*self.x*self.tau*g
+            self._step_stp_dynamics(dt)
+        dr = -self._curr_state + g
+        return dr/self.tau
+
     def get_state(self):
         return self._curr_state
+
+    def get_spks(self):
+        return self._curr_spks
+
+    def get_output(self, dynamics_f=True):
+        if dynamics_f:
+            out = self.get_spks()
+        else:
+            out = self.get_state()
+        return out
 
     def get_time(self):
         return self._curr_time
 
     def initialize_network(self, init_scale=.01):
         self._curr_state = np.random.rand(self.n_neurs)*init_scale
+        self._curr_spks = np.zeros(self.n_neurs)
         self._curr_time = 0
         if self.stp:
             self.x = np.ones(self.n_neurs)
@@ -774,8 +882,12 @@ class RingAttractor(object):
     def focus(self):
         return self.thetas[np.argmax(self._curr_state)]
         
-    def integrate_until(self, t_end, dt, keep=10, dynamics=dynamics_noiseless,
+    def integrate_until(self, t_end, dt, keep=10, dynamics='noiseless',
                         drive_func=None):
+        if dynamics == 'noiseless':
+            dynamics = self.dynamics_noiseless_f
+        elif dynamics == 'poisson':
+            dynamics = self.dynamics_poisson_f
         if drive_func is None:
             drive_func = lambda t, curr, dt: 0
         j = 0
@@ -787,7 +899,7 @@ class RingAttractor(object):
             drive = drive_func(self._curr_time, self._curr_state, dt)
             self.iterate_step(drive, dt, dynamics)
             if (i % interval) == 0 and j < steps_to_keep:
-                trace[j] = self._curr_state
+                trace[j] = self.get_output()
                 focus[j] = self.focus()
                 store_drive[j] = drive
                 time[j] = self._curr_time
