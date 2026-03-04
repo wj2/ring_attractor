@@ -781,7 +781,31 @@ class RingAttractor(object):
             
             self.noise_mag = pb_std
         
-        return self.noise_mag        
+        return self.noise_mag
+
+
+    def estimate_pc_noise(self, cue, cue_start=200, t_until=800, t_step=1,
+                          eps=.1, wait=300, cue_dur=600):
+        self.initialize_network(init_scale=.1)
+        cue_mask = np.mod(np.arange(len(self.thetas)), 2) == 0
+        cue_opp = step_drive_function_creator(
+            self.thetas, 0, 2*np.pi, -cue, cue_start, cue_start + cue_dur,
+            pop_mask=np.logical_not(cue_mask))
+            
+        out, focus, _, ts = self.integrate_until(t_until, t_step,
+                                                 dynamics='poisson',
+                                                 drive_func=cue_opp)
+        t_mask = ts > wait
+        out_t = out[t_mask]
+        
+        pb_std = np.std(np.sum(out_t[:, np.logical_not(cue_mask)], axis=1),
+                        axis=0)
+        pc_std = np.std(np.sum(out_t[:, cue_mask], axis=1),
+                        axis=0)
+        pt_std = np.std(np.sum(out_t, axis=1),
+                        axis=0)
+
+        return pb_std, pc_std, pt_std
         
     def compute_bump_statistics(self):
         ji, je, _ = self.wf_params
